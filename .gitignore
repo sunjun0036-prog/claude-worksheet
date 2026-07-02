@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+
+# SOLIDWORKS 캡처 이미지 (대용량 바이너리, 버전관리 제외)
+SOLIDWORKS Capture/
+
+# Order Notification 실행 산출물 (코드 파일만 커밋)
+Order Notification/__pycache__/
+Order Notification/browser_profile/
+Order Notification/order_watcher.log
+Order Notification/state.json
+Order Notification/_detail_dump.html
+Order Notification/ViewBoardArtList_Headers.txt
+Order Notification/ViewBoardArtList_Response.txt
+Order Notification/수주통보서_다운로드/
+
+# 오피스 잠금 파일
+.~lock.*#
