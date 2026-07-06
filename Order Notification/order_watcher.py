@@ -27,12 +27,14 @@ import datetime as dt
 # ----------------------------- 설정 -----------------------------
 BOARD_URL   = ("https://hmt.hanbal.kr/#/UF/UFA/UFA0000?specialLnb=Y"
                "&moduleCode=UF&menuCode=3000300_001003&pageCode=UFA3000")
-POLL_SECONDS = 60          # 확인 주기(초)
+POLL_SECONDS = 600         # 확인 주기(초). 600=10분
+                           # ※ 주기가 길면 그 사이 로그인 세션이 만료될 수 있음.
 TITLE_FILTER = ""          # 제목에 이 문자열이 포함된 글만 알림(빈칸이면 전체)
 
 # --- 첨부파일 설정 ---
-ATTACH_ENABLE = True        # 새 글의 첨부를 받아 메일에 첨부할지
-ATTACH_FILTER = "수주통보서"  # 파일명에 이 문자열이 포함된 첨부만 다운로드/첨부(빈칸이면 전체)
+ATTACH_ENABLE  = True       # 새 글의 첨부를 받아 메일에 첨부할지
+ATTACH_FILTERS = ["수주통보서", "Quotation"]   # 파일명에 이 중 하나라도 포함되면
+                                               # 다운로드/첨부 (대소문자 무시, 빈 리스트면 전체)
 
 # --------------------------- 메일(SMTP) 설정 ---------------------------
 MAIL_TO   = "sjlee@hanbalmasstech.com"     # 받는 사람
@@ -90,6 +92,24 @@ def save_state(state: dict):
 
 
 # --------------------------- 메일 발송 (SMTP) ---------------------------
+# 메일 게이트웨이(WBlock)가 한글 첨부 파일명을 지워버리므로,
+# 첨부 이름은 영문으로 변환해서 보낸다. (PC 저장본은 원본 한글명 유지)
+FILENAME_MAP = {
+    "수주통보서": "OrderNotice",
+    "관련메일": "RelatedMail",
+    "견적서": "Quotation",
+}
+
+
+def ascii_filename(fname: str) -> str:
+    import re
+    for k, v in FILENAME_MAP.items():
+        fname = fname.replace(k, v)
+    fname = "".join(ch if ord(ch) < 128 else "_" for ch in fname)
+    fname = re.sub(r"_{2,}", "_", fname)          # 연속 '_' 정리
+    return fname.strip("_ ") or "attachment.pdf"
+
+
 def send_mail(subject: str, html_body: str, attachments=None):
     """SMTP 로 메일 발송. 설정(SMTP_*) 값을 사용. Outlook 을 거치지 않음.
        attachments: 첨부할 파일 경로 리스트(선택)."""
@@ -107,14 +127,15 @@ def send_mail(subject: str, html_body: str, attachments=None):
     msg["Date"] = formatdate(localtime=True)
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
+    import mimetypes
     for path in (attachments or []):
         try:
+            fname = ascii_filename(os.path.basename(path))   # 영문 이름으로 변환
+            ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+            subtype = ctype.split("/", 1)[1]
             with open(path, "rb") as f:
-                part = MIMEApplication(f.read())
-            fname = os.path.basename(path)
-            # 한글 파일명 지원(RFC 2231)
-            part.add_header("Content-Disposition", "attachment",
-                            filename=("utf-8", "", fname))
+                part = MIMEApplication(f.read(), _subtype=subtype, Name=fname)
+            part.add_header("Content-Disposition", "attachment", filename=fname)
             msg.attach(part)
         except Exception as e:
             log(f"첨부 추가 실패({path}): {e}")
@@ -214,26 +235,54 @@ def extract_articles(data: dict):
     return (data.get("resultData") or {}).get("articleList") or []
 
 
-def download_matching_attachments(page, post_title, save_dir=None, name_filter=None):
-    """게시판 목록에서 post_title 글을 열어, 파일명에 name_filter 가 포함된 첨부를
-       개별 다운로드 아이콘(div.downIco)으로 내려받아 save_dir 에 저장한다.
-       저장된 파일 경로 리스트를 반환. (글은 목록에서 제목 클릭으로 연다)"""
-    save_dir = save_dir or ATTACH_DIR
-    name_filter = ATTACH_FILTER if name_filter is None else name_filter
+def order_folder_for(post_title: str) -> str:
+    """글 제목에서 수주통보 번호(예: HMT26-142)를 뽑아 저장 폴더 경로를 만든다.
+       Rev.1 글도 기본 번호 폴더에 함께 저장(원본+개정본이 한 폴더에 모임).
+       번호가 없으면 제목을 폴더명으로 사용."""
+    import re
+    m = re.search(r"HMT\d{2}-\d{3}[A-Za-z]?", post_title, re.I)
+    name = m.group(0).upper() if m else post_title
+    name = re.sub(r'[\\/:*?"<>|]', "_", name).strip() or "기타"
+    return os.path.join(ATTACH_DIR, name)
+
+
+def download_matching_attachments(page, post_title, save_dir=None, name_filters=None):
+    """게시판 목록에서 post_title 글을 열어, 파일명에 name_filters 중 하나라도
+       포함된 첨부를 개별 다운로드 아이콘(div.downIco)으로 내려받아 save_dir 에
+       저장한다. 저장된 파일 경로 리스트를 반환. (글은 목록에서 제목 클릭으로 연다)"""
+    save_dir = save_dir or order_folder_for(post_title)
+    name_filters = ATTACH_FILTERS if name_filters is None else name_filters
     saved = []
     try:
         os.makedirs(save_dir, exist_ok=True)
     except Exception:
         pass
 
-    # 1) 글 열기 — 목록에서 '보이는' 제목만 클릭(숨겨진 미리보기 요소 제외)
+    # 1) 글 열기 — '화면에 보이면서' 제목과 거의 일치하는 가장 작은 요소를 클릭
+    #    (숨겨진 미리보기 요소, 제목을 포함한 큰 컨테이너 오클릭 방지)
+    open_js = """
+    (title) => {
+      const cands = Array.from(document.querySelectorAll('*')).filter(el => {
+        if (!el.offsetParent) return false;                 // 숨겨진 요소 제외
+        const t = (el.textContent || '').trim();
+        if (!t.includes(title)) return false;
+        return t.length < title.length + 60;                // 큰 컨테이너 제외
+      });
+      if (!cands.length) return false;
+      cands.sort((a, b) => a.textContent.length - b.textContent.length);
+      const target = cands[0];
+      target.scrollIntoView({block: 'center'});
+      target.click();
+      return true;
+    }
+    """
     try:
-        loc = page.locator("dd.name:visible", has_text=post_title)
-        if loc.count() == 0:
-            loc = page.locator(":visible", has_text=post_title)
-        loc.first.click(timeout=8000)
+        opened = page.evaluate(open_js, post_title)
     except Exception as e:
-        log(f"첨부: 글 열기 실패 '{post_title}': {e}")
+        log(f"첨부: 글 열기 중 예외 '{post_title}': {e}")
+        return saved
+    if not opened:
+        log(f"첨부: 목록에서 '{post_title}' 글을 찾지 못했습니다.")
         return saved
 
     # 2) 첨부 목록(li)이 나타날 때까지 대기
@@ -246,31 +295,40 @@ def download_matching_attachments(page, post_title, save_dir=None, name_filter=N
     lis = page.query_selector_all("ul.fb_div li")
     for li in lis:
         try:
+            if not li.is_visible():                    # 뒤에 숨은 목록 제외
+                continue
             txt = li.inner_text()
         except Exception:
-            txt = ""
-        if name_filter and name_filter not in txt:
+            continue
+        if name_filters and not any(k.lower() in txt.lower() for k in name_filters):
             continue
         downico = li.query_selector("div.downIco")     # 파일별 다운로드 아이콘
         if not downico:
             continue
         try:
+            # 아이콘 클릭 → 'PC저장/ONECHAMBER 저장' 메뉴가 뜸 → 'PC저장' 클릭
+            downico.click()
             with page.expect_download(timeout=30000) as dl_info:
-                downico.click()
+                pc = page.wait_for_selector("text=PC저장", timeout=5000)
+                pc.click()
             dl = dl_info.value
             fname = dl.suggested_filename or "attachment"
             path = os.path.join(save_dir, fname)
             dl.save_as(path)
             saved.append(path)
-            log(f"첨부 저장: {fname}")
+            log(f"첨부 저장: {os.path.relpath(path, ATTACH_DIR)}")
         except Exception as e:
             log(f"첨부 다운로드 실패: {e}")
+            try:                                       # 열린 메뉴가 남았으면 닫기
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
     return saved
 
 
 # ------------------------- 새 글 처리 로직 -------------------------
-def process(data: dict, state: dict) -> bool:
-    """새 글이 있으면 메일 발송. 상태가 바뀌면 True."""
+def process(data: dict, state: dict, page=None) -> bool:
+    """새 글이 있으면 (첨부 받아서) 메일 발송. 상태가 바뀌면 True."""
     articles = extract_articles(data)
     if not articles:
         log("목록이 비어있음(로그인 상태 확인 필요).")
@@ -309,9 +367,27 @@ def process(data: dict, state: dict) -> bool:
 
     for a in new_articles:
         title = a.get("art_title") or a.get("art_content") or "(제목 없음)"
+
+        # 첨부가 있는 글이면 필터에 맞는 첨부를 받아둔다
+        attachments = []
+        if ATTACH_ENABLE and page is not None:
+            try:
+                file_cnt = int(a.get("file_cnt") or 0)
+            except (TypeError, ValueError):
+                file_cnt = 0
+            if file_cnt > 0:
+                try:
+                    attachments = download_matching_attachments(page, title)
+                except Exception as e:
+                    log(f"첨부 처리 실패(메일은 첨부 없이 발송): {e}")
+                try:
+                    page.keyboard.press("Escape")   # 열린 글 팝업 닫기
+                except Exception:
+                    pass
+
         try:
-            send_mail(f"[수주통보] {title}", build_mail_html(a))
-            log(f"메일 발송: {title} (글번호 {seq_of(a)})")
+            send_mail(f"[수주통보] {title}", build_mail_html(a), attachments=attachments)
+            log(f"메일 발송: {title} (글번호 {seq_of(a)}, 첨부 {len(attachments)}개)")
         except Exception as e:
             log(f"메일 발송 실패: {e} / 글: {title}")
 
@@ -366,7 +442,8 @@ def run_watch():
 
     login_alerted = False
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(PROFILE_DIR, headless=False)
+        ctx = p.chromium.launch_persistent_context(
+            PROFILE_DIR, headless=False, accept_downloads=True)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             page.goto(BOARD_URL, wait_until="domcontentloaded")
@@ -399,7 +476,7 @@ def run_watch():
                     continue
                 log("목록을 가져오지 못함(일시적 오류일 수 있음). 다음 주기에 재시도.")
             else:
-                if not process(data, state):
+                if not process(data, state, page):
                     log(f"확인 완료 — 새 글 없음 (최신 글번호 {state.get('last_seq')}).")
 
             time.sleep(POLL_SECONDS)
@@ -579,7 +656,7 @@ def run_attachtest():
        전용 폴더에 저장하고, 그 파일을 첨부한 메일을 보낸다."""
     from playwright.sync_api import sync_playwright
     title = sys.argv[2] if len(sys.argv) > 2 else "수주통보서(HMT26-142) UOP LLC"
-    log(f"첨부 테스트: '{title}' 글에서 '{ATTACH_FILTER}' 포함 첨부를 받습니다.")
+    log(f"첨부 테스트: '{title}' 글에서 {ATTACH_FILTERS} 포함 첨부를 받습니다.")
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             PROFILE_DIR, headless=False, accept_downloads=True)
