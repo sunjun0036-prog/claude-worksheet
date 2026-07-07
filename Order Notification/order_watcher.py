@@ -32,9 +32,12 @@ POLL_SECONDS = 600         # 확인 주기(초). 600=10분
 TITLE_FILTER = ""          # 제목에 이 문자열이 포함된 글만 알림(빈칸이면 전체)
 
 # --- 첨부파일 설정 ---
-ATTACH_ENABLE  = True       # 새 글의 첨부를 받아 메일에 첨부할지
-ATTACH_FILTERS = ["수주통보서", "Quotation"]   # 파일명에 이 중 하나라도 포함되면
-                                               # 다운로드/첨부 (대소문자 무시, 빈 리스트면 전체)
+ATTACH_ENABLE = True                # 새 글의 첨부를 받아 메일에 첨부할지
+ATTACH_ALWAYS = ["수주통보서"]        # 이 키워드가 파일명에 있으면 항상 받음(대소문자 무시)
+# 견적서: 1순위 키워드가 있는 파일을 받고, 하나도 없으면 대체 키워드로 찾아 받음.
+#   (대체 키워드 "Priced" 는 부분일치 → "Priced" 와 "Unpriced" 파일 모두 포함)
+ATTACH_QUOTE_PRIMARY  = "Quotation"  # 견적서 1순위
+ATTACH_QUOTE_FALLBACK = "Priced"     # Quotation 파일이 없을 때 대체(Unpriced 포함)
 
 # --------------------------- 메일(SMTP) 설정 ---------------------------
 MAIL_TO   = "sjlee@hanbalmasstech.com"     # 받는 사람
@@ -246,12 +249,40 @@ def order_folder_for(post_title: str) -> str:
     return os.path.join(ATTACH_DIR, name)
 
 
-def download_matching_attachments(page, post_title, save_dir=None, name_filters=None):
-    """게시판 목록에서 post_title 글을 열어, 파일명에 name_filters 중 하나라도
-       포함된 첨부를 개별 다운로드 아이콘(div.downIco)으로 내려받아 save_dir 에
-       저장한다. 저장된 파일 경로 리스트를 반환. (글은 목록에서 제목 클릭으로 연다)"""
+def select_attachment_lis(files):
+    """files: [(li_handle, 파일명텍스트)]. 다운로드할 li 핸들 리스트를 규칙대로 고른다.
+       - ATTACH_ALWAYS 키워드 포함 파일은 항상
+       - 견적서: ATTACH_QUOTE_PRIMARY(Quotation) 포함 파일, 하나도 없으면
+         ATTACH_QUOTE_FALLBACK(Priced) 부분일치 파일(Unpriced 도 포함)"""
+    chosen = []
+
+    def add(li):
+        if li not in chosen:
+            chosen.append(li)
+
+    # 1) 항상 받는 키워드
+    for li, txt in files:
+        low = txt.lower()
+        if any(k.lower() in low for k in ATTACH_ALWAYS):
+            add(li)
+
+    # 2) 견적서: Quotation 우선, 없으면 Priced(부분일치 → Unpriced 포함)
+    quote = [li for li, txt in files
+             if ATTACH_QUOTE_PRIMARY.lower() in txt.lower()]
+    if not quote:
+        fb = ATTACH_QUOTE_FALLBACK.lower()
+        quote = [li for li, txt in files if fb in txt.lower()]
+    for li in quote:
+        add(li)
+
+    return chosen
+
+
+def download_matching_attachments(page, post_title, save_dir=None):
+    """게시판 목록에서 post_title 글을 열어, 규칙(select_attachment_lis)에 맞는 첨부를
+       개별 다운로드 아이콘(div.downIco)으로 내려받아 save_dir 에 저장한다.
+       저장된 파일 경로 리스트를 반환. (글은 목록에서 제목 클릭으로 연다)"""
     save_dir = save_dir or order_folder_for(post_title)
-    name_filters = ATTACH_FILTERS if name_filters is None else name_filters
     saved = []
     try:
         os.makedirs(save_dir, exist_ok=True)
@@ -292,16 +323,18 @@ def download_matching_attachments(page, post_title, save_dir=None, name_filters=
         log("첨부: 파일 목록을 찾지 못함(첨부 없음 또는 로딩 지연).")
         return saved
 
-    lis = page.query_selector_all("ul.fb_div li")
-    for li in lis:
+    # 보이는 파일들의 (핸들, 파일명) 수집 후 규칙대로 선별
+    files = []
+    for li in page.query_selector_all("ul.fb_div li"):
         try:
             if not li.is_visible():                    # 뒤에 숨은 목록 제외
                 continue
             txt = li.inner_text()
         except Exception:
             continue
-        if name_filters and not any(k.lower() in txt.lower() for k in name_filters):
-            continue
+        files.append((li, txt))
+
+    for li in select_attachment_lis(files):
         downico = li.query_selector("div.downIco")     # 파일별 다운로드 아이콘
         if not downico:
             continue
@@ -655,8 +688,9 @@ def run_attachtest():
     """첨부 다운로드 테스트: 지정한 글을 열어 '수주통보서' 첨부를 받아
        전용 폴더에 저장하고, 그 파일을 첨부한 메일을 보낸다."""
     from playwright.sync_api import sync_playwright
-    title = sys.argv[2] if len(sys.argv) > 2 else "수주통보서(HMT26-142) UOP LLC"
-    log(f"첨부 테스트: '{title}' 글에서 {ATTACH_FILTERS} 포함 첨부를 받습니다.")
+    title = sys.argv[2] if len(sys.argv) > 2 else "수주통보서(HMT26-146) 현대중공업파워시스템"
+    log(f"첨부 테스트: '{title}' — 항상:{ATTACH_ALWAYS}, "
+        f"견적서:{ATTACH_QUOTE_PRIMARY}(없으면 {ATTACH_QUOTE_FALLBACK}) 받습니다.")
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             PROFILE_DIR, headless=False, accept_downloads=True)
@@ -674,25 +708,23 @@ def run_attachtest():
                     break
                 time.sleep(5)
 
+        # 목록에서 실제 게시글 정보를 찾아 진짜 알림과 동일하게 구성
+        art = None
+        for a in extract_articles(data):
+            if title in (a.get("art_title") or ""):
+                art = a
+                break
+        if art is None:
+            art = {"art_title": title, "mbr_nick": "(테스트)", "file_cnt": "0"}
+
         saved = download_matching_attachments(page, title)
         log(f"저장 완료: {len(saved)}개 -> {ATTACH_DIR}")
 
-        if saved:
-            art = {
-                "art_title": title,
-                "mbr_nick": "(테스트)",
-                "deptname": "",
-                "write_date_origin": "",
-                "file_cnt": str(len(saved)),
-                "art_seq_no": "",
-            }
-            try:
-                send_mail(f"[수주통보] {title}", build_mail_html(art), attachments=saved)
-                log(f"첨부 메일 발송 완료 ({len(saved)}개 첨부).")
-            except Exception as e:
-                log(f"첨부 메일 발송 실패: {e}")
-        else:
-            log("받은 첨부가 없어 메일은 보내지 않았습니다.")
+        try:
+            send_mail(f"[수주통보] {title}", build_mail_html(art), attachments=saved)
+            log(f"첨부 메일 발송 완료 ({len(saved)}개 첨부).")
+        except Exception as e:
+            log(f"첨부 메일 발송 실패: {e}")
         try:
             ctx.close()
         except Exception:
