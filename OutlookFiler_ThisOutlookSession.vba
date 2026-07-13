@@ -12,7 +12,10 @@
 '   - 폴더 목록을 '실시간으로 읽어' 매핑하므로, 새 폴더만 만들면
 '     코드 수정/재시작 없이 바로 인식됨 (모든 연도 폴더 검색)
 '   - 폴더명에 없는 추가 키워드는 AliasList 로 보완 (예: HMT26-063 -> 260199)
-'   - (받는사람=나 인 메일을 따로 모으는 기능은 Outlook 기본 규칙으로 처리하므로 여기 없음)
+'   - 모든 메일을 SJLEE\받은 편지함 / SJLEE\보낸 편지함으로 전체 백업
+'     (웹에서 미리 읽어 Outlook 규칙이 동작하지 않는 경우도 포함)
+'   - [수주통보] 메일은 수주통보 폴더에만, 백업·Remind 없음
+'   - 받는사람에 내가 있으면 SJLEE\Remind 에도 복사 (WBlock·수주통보 제외)
 '   - Outlook이 꺼져 있던 동안 쌓인 메일은 다음 실행 때 한 번에 처리
 '
 ' 중복 방지:
@@ -60,6 +63,14 @@ Private Sub FileItem(ByVal Item As Object, ByVal IsSent As Boolean)
     If TypeName(Item) <> "MailItem" Then Exit Sub
     If IsStamped(Item) Then Exit Sub          ' 이미 처리한 메일
 
+    ' 수주통보: 수주통보 폴더로 이동(복사 아님), 백업·Remind 건너뜀
+    If InStr(LCase(Item.Subject), LCase(JUSU_KEYWORD)) > 0 Then
+        Dim jtbFld As Outlook.Folder
+        Set jtbFld = GetSub(GetRoot(), JUSU_FOLDER)
+        If Not jtbFld Is Nothing Then DoMove Item, jtbFld
+        Exit Sub
+    End If
+
     Dim haystack As String
     haystack = LCase(Item.Subject & " " & Item.Body)
 
@@ -83,10 +94,46 @@ Private Sub FileItem(ByVal Item As Object, ByVal IsSent As Boolean)
         End If
     Next key
 
+    ' 2) 전체 백업: 키워드 매칭 여부와 무관하게 모든 메일 백업
+    Dim bkName As String
+    If IsSent Then bkName = BACKUP_SENT Else bkName = BACKUP_INBOX
+    Dim bkFld As Outlook.Folder
+    Set bkFld = GetSub(GetRoot(), bkName)
+    If Not bkFld Is Nothing Then
+        If Not seen.Exists(bkFld.FolderPath) Then
+            seen.Add bkFld.FolderPath, True
+            DoCopy Item, bkFld
+        End If
+    End If
+
+    ' 3) Remind: 받은 메일, 받는사람에 내가 있고, WBlock 제외
+    '    (수주통보는 위에서 이미 Exit Sub 했으므로 여기까지 오지 않음)
+    If Not IsSent Then
+        If InStr(LCase(Item.Subject), "wblock") = 0 Then
+            If IsAddressedToMe(Item) Then
+                Dim rmFld As Outlook.Folder
+                Set rmFld = GetSub(GetRoot(), REMIND_FOLDER)
+                If Not rmFld Is Nothing Then
+                    If Not seen.Exists(rmFld.FolderPath) Then
+                        seen.Add rmFld.FolderPath, True
+                        DoCopy Item, rmFld
+                    End If
+                End If
+            End If
+        End If
+    End If
+
     ' 표식은 DoCopy 안에서 (복사 전에) 원본에 찍힌다.
 End Sub
 
-'======================== 폴더 복사 ========================
+'======================== 폴더 이동 / 복사 ========================
+
+' 수주통보 전용: 원본을 목적지로 이동
+Private Sub DoMove(ByVal Item As Object, ByVal target As Outlook.Folder)
+    On Error Resume Next
+    Stamp Item
+    Item.Move target
+End Sub
 
 ' 원본에 '먼저' 표식을 찍은 뒤 복사한다. 사본은 표식을 상속한 채 태어나므로,
 ' 감시 폴더에 잠깐 생기는 사본의 ItemAdd 이벤트가 어떤 타이밍에도 재처리되지 않는다.
@@ -98,6 +145,24 @@ Private Sub DoCopy(ByVal Item As Object, ByVal target As Outlook.Folder)
     Set cpy = Item.Copy
     cpy.Move target
 End Sub
+
+'======================== 보조 함수 ========================
+
+Private Function IsAddressedToMe(ByVal Item As Object) As Boolean
+    On Error Resume Next
+    Dim myAddr As String, myName As String
+    myAddr = LCase(Application.Session.CurrentUser.Address)
+    myName = LCase(Application.Session.CurrentUser.Name)
+    Dim r As Outlook.Recipient
+    For Each r In Item.Recipients
+        If r.Type = olTo Then
+            If LCase(r.Address) = myAddr Or LCase(r.Name) = myName Then
+                IsAddressedToMe = True
+                Exit Function
+            End If
+        End If
+    Next r
+End Function
 
 '======================== 중복 방지 표식 ========================
 

@@ -15,8 +15,13 @@ Option Explicit
 
 ' ===== 설정 (필요 시 여기만 수정) =====
 Public Const STORE_ROOT As String = "SJLEE"        ' 목적지 폴더가 있는 저장소 이름
-Public Const JOB_FOLDER As String = "Job"          ' 프로젝트 상위 폴더 (그 아래 연도 폴더들)
-Public Const STAMP_NAME As String = "FiledByMacro" ' 중복 방지 표식 이름
+Public Const JOB_FOLDER As String = "Job"              ' 프로젝트 상위 폴더 (그 아래 연도 폴더들)
+Public Const BACKUP_INBOX As String = "받은 편지함"   ' 전체 백업 대상 (받은 메일)
+Public Const BACKUP_SENT As String = "보낸 편지함"    ' 전체 백업 대상 (보낸 메일)
+Public Const REMIND_FOLDER As String = "Remind"        ' 나에게 직접 온 메일 복사 위치
+Public Const JUSU_FOLDER As String = "수주통보"        ' 수주통보 전용 폴더
+Public Const JUSU_KEYWORD As String = "[수주통보]"     ' 수주통보 식별 키워드
+Public Const STAMP_NAME As String = "FiledByMacro"    ' 중복 방지 표식 이름
 
 ' ===== 캐시 (모듈 수준에 보관) =====
 Private mCache As Object        ' 소문자 키워드 -> Outlook.Folder
