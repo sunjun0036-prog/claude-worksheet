@@ -23,6 +23,7 @@ import os
 import json
 import time
 import threading
+import traceback
 import datetime as dt
 
 # ----------------------------- 설정 -----------------------------
@@ -598,37 +599,46 @@ def run_watch():
 
     with sync_playwright() as p:
         while not _stop_requested:
-            # 1) 크롬 새로 띄우고 게시판으로 이동
-            ctx = p.chromium.launch_persistent_context(
-                PROFILE_DIR, headless=False, accept_downloads=True)
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            ctx = None
             try:
-                page.goto(BOARD_URL, wait_until="domcontentloaded")
+                # 1) 크롬 새로 띄우고 게시판으로 이동
+                ctx = p.chromium.launch_persistent_context(
+                    PROFILE_DIR, headless=False, accept_downloads=True)
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                try:
+                    page.goto(BOARD_URL, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                page.wait_for_timeout(2000)      # 로그인 리다이렉트가 자리잡을 시간
+
+                # 2) 로그인 확보
+                _ensure_logged_in(page)
+
+                # 3) 감시 루프 (로그인 유지되는 동안)
+                while not _stop_requested:
+                    data = fetch_article_data(page)
+                    if data is None or not extract_articles(data):
+                        if _is_login_page(page):
+                            log("로그인이 풀렸습니다 → 크롬을 닫고 새로 띄워 다시 로그인합니다.")
+                            break              # 바깥 루프로 나가 재시작
+                        log("목록을 가져오지 못함(일시적 오류). 다음 주기에 재시도.")
+                    else:
+                        if not process(data, state, page):
+                            log(f"확인 완료 — 새 글 없음 (최신 글번호 {state.get('last_seq')}).")
+                    _interruptible_sleep(POLL_SECONDS)
+
             except Exception:
-                pass
-            page.wait_for_timeout(2000)      # 로그인 리다이렉트가 자리잡을 시간
-
-            # 2) 로그인 확보
-            _ensure_logged_in(page)
-
-            # 3) 감시 루프 (로그인 유지되는 동안)
-            while not _stop_requested:
-                data = fetch_article_data(page)
-                if data is None or not extract_articles(data):
-                    if _is_login_page(page):
-                        log("로그인이 풀렸습니다 → 크롬을 닫고 새로 띄워 다시 로그인합니다.")
-                        break              # 바깥 루프로 나가 재시작
-                    log("목록을 가져오지 못함(일시적 오류). 다음 주기에 재시도.")
-                else:
-                    if not process(data, state, page):
-                        log(f"확인 완료 — 새 글 없음 (최신 글번호 {state.get('last_seq')}).")
-                _interruptible_sleep(POLL_SECONDS)
-
-            # 4) 이 세션 크롬 닫기 (stop 이면 종료, 아니면 바깥 루프가 새로 띄움)
-            try:
-                ctx.close()
-            except Exception:
-                pass
+                # 예상치 못한 오류라도 죽지 않고, 원인을 남긴 뒤 새 크롬으로 재시작
+                log("예상치 못한 오류 — 20초 후 크롬을 새로 띄워 재시작합니다:\n"
+                    + traceback.format_exc())
+                _interruptible_sleep(20)
+            finally:
+                # 4) 이 세션 크롬 닫기 (stop 이면 종료, 아니면 바깥 루프가 새로 띄움)
+                try:
+                    if ctx is not None:
+                        ctx.close()
+                except Exception:
+                    pass
 
     log("감시를 종료했습니다.")
 
@@ -856,10 +866,17 @@ def main():
     elif mode == "attachtest":
         run_attachtest()
     elif mode == "watch":
-        try:
-            run_watch()
-        except KeyboardInterrupt:
-            log("감시를 종료했습니다. (Ctrl+C)")
+        # 최후의 방어선: 무슨 일이 있어도 조용히 죽지 않고 기록 후 재시작
+        while True:
+            try:
+                run_watch()
+                break                      # 정상 종료(stop)
+            except KeyboardInterrupt:
+                log("감시를 종료했습니다. (Ctrl+C)")
+                break
+            except Exception:
+                log("치명적 오류 — 15초 후 전체 재시작합니다:\n" + traceback.format_exc())
+                time.sleep(15)
     elif mode == "test":
         run_test()
     elif mode == "diag":
