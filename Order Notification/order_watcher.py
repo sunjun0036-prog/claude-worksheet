@@ -515,6 +515,15 @@ def run_login():
     log("로그인 세션이 저장되었습니다. 이제 'python order_watcher.py watch' 로 감시를 시작하세요.")
 
 
+def _is_page_dead(page) -> bool:
+    """크롬 창(page/컨텍스트/브라우저)이 닫혔는지 판별.
+       절전·창 닫힘 등으로 브라우저 프로세스가 죽으면 True → 새 크롬으로 복구해야 함."""
+    try:
+        return bool(page.is_closed())
+    except Exception:
+        return True
+
+
 def _is_login_page(page) -> bool:
     """현재 페이지가 로그인 화면인지 판별."""
     try:
@@ -638,8 +647,15 @@ def run_watch():
 
                 # 3) 감시 루프 (로그인 유지되는 동안)
                 while not _stop_requested:
+                    # 크롬 창이 절전/닫힘 등으로 죽었으면 바깥 루프로 나가 새로 띄운다
+                    if _is_page_dead(page):
+                        log("크롬 창이 닫혔습니다(절전/창닫힘 등) → 크롬을 새로 띄워 복구합니다.")
+                        break
                     data = fetch_article_data(page)
                     if data is None or not extract_articles(data):
+                        if _is_page_dead(page):
+                            log("크롬 창이 닫혔습니다(절전/창닫힘 등) → 크롬을 새로 띄워 복구합니다.")
+                            break              # 바깥 루프로 나가 재시작
                         if _is_login_page(page):
                             log("로그인이 풀렸습니다 → 크롬을 닫고 새로 띄워 다시 로그인합니다.")
                             break              # 바깥 루프로 나가 재시작
